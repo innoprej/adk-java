@@ -18,9 +18,13 @@ package com.google.adk.tokt.codecs
 
 import com.google.adk.kt.logging.LoggerFactory
 import com.google.adk.kt.types.Blob as KtBlob
+import com.google.adk.kt.types.CodeExecutionResult as KtCodeExecutionResult
+import com.google.adk.kt.types.ExecutableCode as KtExecutableCode
 import com.google.adk.kt.types.FileData as KtFileData
 import com.google.adk.kt.types.FunctionCall as KtFunctionCall
 import com.google.adk.kt.types.FunctionResponse as KtFunctionResponse
+import com.google.adk.kt.types.Language as KtLanguage
+import com.google.adk.kt.types.Outcome as KtOutcome
 import com.google.adk.kt.types.Part as KtPart
 import com.google.adk.kt.types.PartialArg as KtPartialArg
 import com.google.adk.kt.types.PartialArgValue as KtPartialArgValue
@@ -29,10 +33,14 @@ import com.google.adk.kt.types.ToolResponse as KtToolResponse
 import com.google.adk.kt.types.ToolType as KtToolType
 import com.google.adk.kt.types.VideoMetadata as KtVideoMetadata
 import com.google.genai.types.Blob as GenaiBlob
+import com.google.genai.types.CodeExecutionResult as GenaiCodeExecutionResult
+import com.google.genai.types.ExecutableCode as GenaiExecutableCode
 import com.google.genai.types.FileData as GenaiFileData
 import com.google.genai.types.FunctionCall as GenaiFunctionCall
 import com.google.genai.types.FunctionResponse as GenaiFunctionResponse
+import com.google.genai.types.Language as GenaiLanguage
 import com.google.genai.types.NullValue as GenaiNullValue
+import com.google.genai.types.Outcome as GenaiOutcome
 import com.google.genai.types.Part as GenaiPart
 import com.google.genai.types.PartialArg as GenaiPartialArg
 import com.google.genai.types.ToolCall as GenaiToolCall
@@ -46,14 +54,15 @@ import kotlin.time.toKotlinDuration
 /**
  * Converts a [Part][KtPart] between the genai type ADK Java exposes and the ADK Kotlin type.
  * Carries text, inline binary data ([KtBlob]), file references ([KtFileData]), function
- * call/response parts, server-side tool call/response parts ([KtToolCall] / [KtToolResponse]), the
- * model "thought" marker/signature, video metadata, and part metadata. Shared by [ContentCodec] and
- * the artifact service.
+ * call/response parts, server-side tool call/response parts ([KtToolCall] / [KtToolResponse]),
+ * code-execution parts ([KtExecutableCode] / [KtCodeExecutionResult]), the model "thought"
+ * marker/signature, video metadata, and part metadata. Shared by [ContentCodec] and the artifact
+ * service.
  *
  * Returns null for an empty part and for one carrying only a field the Kotlin [KtPart] has no
- * counterpart for - `executableCode`, `codeExecutionResult` - which [ContentCodec] then drops from
- * the content. The loss is forced, so it is logged once per kind rather than silent; see
- * [com.google.adk.tokt.JavaAdkToKt].
+ * counterpart for - `mediaResolution`, `audioTranscription`, `mediaProcessing` - which
+ * [ContentCodec] then drops from the content. The loss is forced, so it is logged once per kind
+ * rather than silent; see [com.google.adk.tokt.JavaAdkToKt].
  */
 internal object PartCodec {
 
@@ -65,8 +74,9 @@ internal object PartCodec {
   private fun warnUnmappedKind(part: GenaiPart) {
     val kind =
       when {
-        part.executableCode().isPresent -> "executableCode"
-        part.codeExecutionResult().isPresent -> "codeExecutionResult"
+        part.mediaResolution().isPresent -> "mediaResolution"
+        part.audioTranscription().isPresent -> "audioTranscription"
+        part.mediaProcessing().isPresent -> "mediaProcessing"
         else -> return // A genuinely empty part carries no information to lose.
       }
     if (warnedUnmappedKinds.add(kind)) {
@@ -101,6 +111,8 @@ internal object PartCodec {
     val thoughtSignature = part.thoughtSignature().getOrNull()
     val partMetadata = part.partMetadata().getOrNull()
     val videoMetadata = part.videoMetadata().getOrNull()?.let { videoMetadataFromJava(it) }
+    val executableCode = part.executableCode().getOrNull()
+    val codeExecutionResult = part.codeExecutionResult().getOrNull()
     val base =
       when {
         functionCall != null -> KtPart(functionCall = functionCallFromJava(functionCall))
@@ -108,6 +120,9 @@ internal object PartCodec {
           KtPart(functionResponse = functionResponseFromJava(functionResponse))
         toolCall != null -> KtPart(toolCall = toolCallFromJava(toolCall))
         toolResponse != null -> KtPart(toolResponse = toolResponseFromJava(toolResponse))
+        executableCode != null -> KtPart(executableCode = executableCodeFromJava(executableCode))
+        codeExecutionResult != null ->
+          KtPart(codeExecutionResult = codeExecutionResultFromJava(codeExecutionResult))
         inlineData != null -> KtPart(inlineData = blobFromJava(inlineData))
         fileData != null -> KtPart(fileData = fileDataFromJava(fileData))
         text != null -> KtPart(text = text)
@@ -139,6 +154,8 @@ internal object PartCodec {
     val inlineData = part.inlineData
     val fileData = part.fileData
     val text = part.text
+    val executableCode = part.executableCode
+    val codeExecutionResult = part.codeExecutionResult
     val builder =
       when {
         functionCall != null -> GenaiPart.builder().functionCall(functionCallToJava(functionCall))
@@ -146,6 +163,10 @@ internal object PartCodec {
           GenaiPart.builder().functionResponse(functionResponseToJava(functionResponse))
         toolCall != null -> GenaiPart.builder().toolCall(toolCallToJava(toolCall))
         toolResponse != null -> GenaiPart.builder().toolResponse(toolResponseToJava(toolResponse))
+        executableCode != null ->
+          GenaiPart.builder().executableCode(executableCodeToJava(executableCode))
+        codeExecutionResult != null ->
+          GenaiPart.builder().codeExecutionResult(codeExecutionResultToJava(codeExecutionResult))
         inlineData != null -> GenaiPart.builder().inlineData(blobToJava(inlineData))
         fileData != null -> GenaiPart.builder().fileData(fileDataToJava(fileData))
         text != null -> GenaiPart.builder().text(text)
@@ -251,6 +272,8 @@ internal object PartCodec {
     return builder.build()
   }
 
+  // genai FunctionResponse.willContinue/scheduling/parts have no Kotlin counterpart and are
+  // dropped.
   private fun functionResponseFromJava(response: GenaiFunctionResponse): KtFunctionResponse =
     KtFunctionResponse(
       name = response.name().getOrNull() ?: "",
@@ -261,6 +284,36 @@ internal object PartCodec {
   private fun functionResponseToJava(response: KtFunctionResponse): GenaiFunctionResponse {
     val builder = GenaiFunctionResponse.builder().name(response.name).response(response.response)
     response.id?.let { builder.id(it) }
+    return builder.build()
+  }
+
+  private fun executableCodeFromJava(code: GenaiExecutableCode): KtExecutableCode =
+    KtExecutableCode(
+      code = code.code().getOrNull(),
+      language = enumByNameOrNull<KtLanguage>(code.language().getOrNull()?.knownEnum()?.name),
+      id = code.id().getOrNull(),
+    )
+
+  private fun executableCodeToJava(code: KtExecutableCode): GenaiExecutableCode {
+    val builder = GenaiExecutableCode.builder()
+    code.code?.let { builder.code(it) }
+    code.language?.let { builder.language(GenaiLanguage(it.name)) }
+    code.id?.let { builder.id(it) }
+    return builder.build()
+  }
+
+  private fun codeExecutionResultFromJava(result: GenaiCodeExecutionResult): KtCodeExecutionResult =
+    KtCodeExecutionResult(
+      outcome = enumByNameOrNull<KtOutcome>(result.outcome().getOrNull()?.knownEnum()?.name),
+      output = result.output().getOrNull(),
+      id = result.id().getOrNull(),
+    )
+
+  private fun codeExecutionResultToJava(result: KtCodeExecutionResult): GenaiCodeExecutionResult {
+    val builder = GenaiCodeExecutionResult.builder()
+    result.outcome?.let { builder.outcome(GenaiOutcome(it.name)) }
+    result.output?.let { builder.output(it) }
+    result.id?.let { builder.id(it) }
     return builder.build()
   }
 

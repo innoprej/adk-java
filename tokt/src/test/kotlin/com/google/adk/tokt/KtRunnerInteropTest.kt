@@ -51,12 +51,14 @@ import com.google.adk.kt.types.Blob as KtBlob
 import com.google.adk.kt.types.Content as KtContent
 import com.google.adk.kt.types.FileData as KtFileData
 import com.google.adk.kt.types.FunctionCallingConfig as KtFunctionCallingConfig
+import com.google.adk.kt.types.FunctionCallingConfigMode as KtFunctionCallingConfigMode
 import com.google.adk.kt.types.FunctionResponse as KtFunctionResponse
 import com.google.adk.kt.types.GenerateContentConfig as KtConfig
 import com.google.adk.kt.types.GenerationConfigRoutingConfig as KtRoutingConfig
 import com.google.adk.kt.types.GenerationConfigRoutingConfigManualRoutingMode as KtManualRoutingMode
 import com.google.adk.kt.types.GoogleMaps as KtGoogleMaps
 import com.google.adk.kt.types.GoogleSearch as KtGoogleSearch
+import com.google.adk.kt.types.HarmBlockMethod as KtHarmBlockMethod
 import com.google.adk.kt.types.HarmBlockThreshold as KtHarmBlockThreshold
 import com.google.adk.kt.types.HarmCategory as KtHarmCategory
 import com.google.adk.kt.types.MediaResolution as KtMediaResolution
@@ -107,6 +109,7 @@ import com.google.adk.tools.BaseTool as JavaBaseTool
 import com.google.adk.tools.BaseToolset as JavaBaseToolset
 import com.google.adk.tools.ToolContext as JavaToolContext
 import com.google.errorprone.annotations.CanIgnoreReturnValue
+import com.google.genai.types.CodeExecutionResult as GenaiCodeExecutionResult
 import com.google.genai.types.Content as GenaiContent
 import com.google.genai.types.CustomMetadata as GenaiCustomMetadata
 import com.google.genai.types.ExecutableCode as GenaiExecutableCode
@@ -1066,11 +1069,9 @@ class KtRunnerInteropTest {
   }
 
   @Test
-  fun ktRunner_modelPartCarryingOnlyAnUnmappedKind_isDropped() = runBlocking {
-    // executableCode has no Kotlin counterpart, so a part carrying only it must be dropped rather
-    // than surviving as an empty part. This is what makes the primary-payload branches in
-    // PartCodec.fromJava observable: a part's thought/metadata fields are re-attached afterwards
-    // either way, so the drop is the only externally visible difference.
+  fun ktRunner_modelPartWithExecutableCode_isCarried() = runBlocking {
+    // executableCode now has a Kotlin counterpart, so a part carrying it crosses the Java -> Kotlin
+    // interop instead of being dropped: the event keeps both the executable-code part and the text.
     val model =
       object : JavaBaseLlm("java-model") {
         override fun generateContent(
@@ -1105,9 +1106,116 @@ class KtRunnerInteropTest {
 
     val parts = events.firstNotNullOfOrNull { it.content?.parts?.takeIf { p -> p.isNotEmpty() } }
     assertEquals(
-      listOf("done"),
+      "print(1)",
+      parts?.getOrNull(0)?.executableCode?.code,
+      "the executableCode part should be carried across the interop",
+    )
+    assertEquals(
+      listOf(null, "done"),
       parts?.map { it.text },
-      "the executableCode-only part should be dropped, leaving just the text part",
+      "the executableCode part (no text) and the text part should both survive",
+    )
+  }
+
+  @Test
+  fun ktRunner_modelPartWithCodeExecutionResult_isCarried() = runBlocking {
+    // codeExecutionResult now has a Kotlin counterpart, so a part carrying it crosses the
+    // Java -> Kotlin interop instead of being dropped.
+    val model =
+      object : JavaBaseLlm("java-model") {
+        override fun generateContent(
+          llmRequest: JavaLlmRequest,
+          stream: Boolean,
+        ): Flowable<JavaLlmResponse> =
+          Flowable.just(
+            JavaLlmResponse.builder()
+              .content(
+                GenaiContent.builder()
+                  .role("model")
+                  .parts(
+                    listOf(
+                      GenaiPart.builder()
+                        .codeExecutionResult(GenaiCodeExecutionResult.builder().output("4").build())
+                        .build(),
+                      GenaiPart.builder().text("the answer is 4").build(),
+                    )
+                  )
+                  .build()
+              )
+              .build()
+          )
+
+        override fun connect(llmRequest: JavaLlmRequest): JavaBaseLlmConnection =
+          throw UnsupportedOperationException()
+      }
+    val agent = KtLlmAgent(name = "a", model = JavaAdkToKt.asKtModel(model))
+    val runner = KtInMemoryRunner(agent, appName = "app")
+
+    val events = runner.turn()
+
+    val parts = events.firstNotNullOfOrNull { it.content?.parts?.takeIf { p -> p.isNotEmpty() } }
+    assertEquals(
+      "4",
+      parts?.getOrNull(0)?.codeExecutionResult?.output,
+      "the codeExecutionResult part should be carried across the interop",
+    )
+  }
+
+  @Test
+  fun ktRunner_configWithNewFields_reachesJavaModel() = runBlocking {
+    // GenerateContentConfigCodec.toJava: the Kotlin agent config's newly-mapped fields (seed,
+    // responseModalities, function-calling mode, safety block method) reach the Java model.
+    val model = SequentialJavaModel(listOf(modelText("done")))
+    val agent =
+      KtLlmAgent(
+        name = "a",
+        model = JavaAdkToKt.asKtModel(model),
+        generateContentConfig =
+          KtConfig(
+            seed = 42,
+            responseModalities = listOf("TEXT"),
+            toolConfig =
+              KtToolConfig(
+                functionCallingConfig =
+                  KtFunctionCallingConfig(mode = KtFunctionCallingConfigMode.ANY)
+              ),
+            safetySettings =
+              listOf(
+                KtSafetySetting(
+                  category = KtHarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                  threshold = KtHarmBlockThreshold.BLOCK_ONLY_HIGH,
+                  method = KtHarmBlockMethod.SEVERITY,
+                )
+              ),
+          ),
+      )
+    val runner = KtInMemoryRunner(agent, appName = "app")
+
+    runner.turn()
+
+    val cfg =
+      assertNotNull(
+        model.requests.first().config().getOrNull(),
+        "the agent config should reach the Java model",
+      )
+    assertEquals(42, cfg.seed().getOrNull(), "seed")
+    assertEquals(listOf("TEXT"), cfg.responseModalities().getOrNull(), "responseModalities")
+    assertEquals(
+      "ANY",
+      cfg
+        .toolConfig()
+        .getOrNull()
+        ?.functionCallingConfig()
+        ?.getOrNull()
+        ?.mode()
+        ?.getOrNull()
+        ?.toString(),
+      "functionCallingConfig.mode",
+    )
+    assertEquals(
+      "SEVERITY",
+      cfg.safetySettings().getOrNull()?.firstOrNull()?.method()?.getOrNull()?.toString(),
+      "safetySetting.method",
     )
   }
 
