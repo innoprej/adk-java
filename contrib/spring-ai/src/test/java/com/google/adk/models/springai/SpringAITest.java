@@ -23,11 +23,14 @@ import static org.mockito.Mockito.when;
 
 import com.google.adk.models.LlmRequest;
 import com.google.adk.models.LlmResponse;
+import com.google.adk.tools.BaseTool;
 import com.google.genai.types.Blob;
 import com.google.genai.types.Content;
 import com.google.genai.types.FinishReason;
 import com.google.genai.types.FunctionCall;
+import com.google.genai.types.FunctionDeclaration;
 import com.google.genai.types.Part;
+import com.google.genai.types.Schema;
 import io.reactivex.rxjava3.functions.Consumer;
 import io.reactivex.rxjava3.plugins.RxJavaPlugins;
 import io.reactivex.rxjava3.subscribers.TestSubscriber;
@@ -35,6 +38,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.BeforeEach;
@@ -47,6 +51,7 @@ import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.chat.model.Generation;
 import org.springframework.ai.chat.model.StreamingChatModel;
+import org.springframework.ai.chat.prompt.ChatOptions;
 import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.content.Media;
 import org.springframework.core.io.ByteArrayResource;
@@ -568,6 +573,167 @@ class SpringAITest {
     springAI.generateContent(testRequest, true).test().cancel();
 
     assertThat(cancelled).isTrue();
+  }
+
+  @Test
+  void generateContent_wrapperWithoutGetOptions_errorNamesGetOptions() {
+    // Regression test for GitHub adk-java #1731: a delegating ChatModel that does not override
+    // getOptions() returns the interface default (an empty DefaultChatOptions), so ADK builds
+    // provider-neutral tool options and the provider's cast fails with a bare ClassCastException.
+    SpringAI springAI = new SpringAI(new OptionsForgettingWrapper(new OptionsCastingChatModel()));
+
+    TestSubscriber<LlmResponse> testObserver =
+        springAI.generateContent(requestWithTool(), false).test();
+
+    testObserver.awaitDone(5, TimeUnit.SECONDS);
+    testObserver.assertError(
+        error ->
+            error instanceof RuntimeException
+                && error.getMessage().contains("getOptions()")
+                && error.getCause() instanceof ClassCastException);
+  }
+
+  @Test
+  void generateContent_streamingWrapperWithoutGetOptions_errorNamesGetOptions() {
+    SpringAI springAI = new SpringAI(new OptionsForgettingWrapper(new OptionsCastingChatModel()));
+
+    TestSubscriber<LlmResponse> testObserver =
+        springAI.generateContent(requestWithTool(), true).test();
+
+    testObserver.awaitDone(5, TimeUnit.SECONDS);
+    testObserver.assertError(
+        error ->
+            error instanceof RuntimeException
+                && error.getMessage().contains("getOptions()")
+                && error.getCause() instanceof ClassCastException);
+  }
+
+  @Test
+  void generateContent_modelWithDefaultGetOptionsAndTools_succeeds() {
+    // Models that keep the interface default getOptions() but do not cast the prompt options,
+    // such as test doubles, must keep working.
+    SpringAI springAI =
+        new SpringAI(new OptionsForgettingWrapper(new OptionsIgnoringChatModel(testChatResponse)));
+
+    TestSubscriber<LlmResponse> testObserver =
+        springAI.generateContent(requestWithTool(), false).test();
+
+    testObserver.awaitDone(5, TimeUnit.SECONDS);
+    testObserver.assertNoErrors();
+    testObserver.assertValueCount(1);
+  }
+
+  @Test
+  void generateContent_getOptionsThrows_errorIsWrapped() {
+    // The model's own options are resolved before the prompt is built; a failure there must take
+    // the same error path as any other failure instead of escaping the Flowable.
+    SpringAI springAI = new SpringAI(new OptionsThrowingChatModel());
+
+    TestSubscriber<LlmResponse> testObserver = springAI.generateContent(testRequest, false).test();
+
+    testObserver.awaitDone(5, TimeUnit.SECONDS);
+    testObserver.assertError(
+        error ->
+            error instanceof RuntimeException
+                && error.getCause() instanceof UnsupportedOperationException);
+  }
+
+  @Test
+  void generateContent_streamingGetOptionsThrows_errorIsWrapped() {
+    SpringAI springAI = new SpringAI(new OptionsThrowingChatModel());
+
+    TestSubscriber<LlmResponse> testObserver = springAI.generateContent(testRequest, true).test();
+
+    testObserver.awaitDone(5, TimeUnit.SECONDS);
+    testObserver.assertError(
+        error ->
+            error instanceof RuntimeException
+                && error.getCause() instanceof UnsupportedOperationException);
+  }
+
+  private LlmRequest requestWithTool() {
+    FunctionDeclaration function =
+        FunctionDeclaration.builder()
+            .name("ping")
+            .description("Replies with pong")
+            .parameters(
+                Schema.builder()
+                    .type("OBJECT")
+                    .properties(Map.of("message", Schema.builder().type("STRING").build()))
+                    .build())
+            .build();
+    BaseTool pingTool =
+        new BaseTool("ping", "Replies with pong") {
+          @Override
+          public Optional<FunctionDeclaration> declaration() {
+            return Optional.of(function);
+          }
+        };
+    return testRequest.toBuilder().tools(Map.of("ping", pingTool)).build();
+  }
+
+  /** Options type of a provider that casts {@link Prompt#getOptions()} to its own options. */
+  private interface ProviderChatOptions extends ChatOptions {}
+
+  /** A provider model that, like Spring AI OpenAI, casts the prompt options to its own type. */
+  private static final class OptionsCastingChatModel implements ChatModel {
+    @Override
+    public ChatResponse call(Prompt prompt) {
+      ProviderChatOptions unused = (ProviderChatOptions) prompt.getOptions();
+      throw new AssertionError("Expected the prompt options cast to fail");
+    }
+
+    @Override
+    public Flux<ChatResponse> stream(Prompt prompt) {
+      ProviderChatOptions unused = (ProviderChatOptions) prompt.getOptions();
+      throw new AssertionError("Expected the prompt options cast to fail");
+    }
+  }
+
+  /** A model whose {@code getOptions()} fails, as a wrapper that rejects the call would. */
+  private static final class OptionsThrowingChatModel implements ChatModel {
+    @Override
+    public ChatResponse call(Prompt prompt) {
+      throw new AssertionError("Expected getOptions() to fail first");
+    }
+
+    @Override
+    public ChatOptions getOptions() {
+      throw new UnsupportedOperationException("options are not available");
+    }
+  }
+
+  /** A model that ignores the prompt options. */
+  private static final class OptionsIgnoringChatModel implements ChatModel {
+    private final ChatResponse response;
+
+    OptionsIgnoringChatModel(ChatResponse response) {
+      this.response = response;
+    }
+
+    @Override
+    public ChatResponse call(Prompt prompt) {
+      return response;
+    }
+  }
+
+  /** A delegating model that, as in the bug report, does not override {@code getOptions()}. */
+  private static final class OptionsForgettingWrapper implements ChatModel {
+    private final ChatModel delegate;
+
+    OptionsForgettingWrapper(ChatModel delegate) {
+      this.delegate = delegate;
+    }
+
+    @Override
+    public ChatResponse call(Prompt prompt) {
+      return delegate.call(prompt);
+    }
+
+    @Override
+    public Flux<ChatResponse> stream(Prompt prompt) {
+      return delegate.stream(prompt);
+    }
   }
 
   private static FunctionCall onlyFunctionCall(LlmResponse response) {

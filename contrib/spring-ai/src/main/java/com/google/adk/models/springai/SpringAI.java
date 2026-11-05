@@ -32,12 +32,14 @@ import io.reactivex.rxjava3.core.Flowable;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicReference;
 import org.jspecify.annotations.Nullable;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.chat.model.StreamingChatModel;
 import org.springframework.ai.chat.prompt.ChatOptions;
 import org.springframework.ai.chat.prompt.Prompt;
+import org.springframework.ai.model.tool.ToolCallingChatOptions;
 
 /**
  * Spring AI implementation of BaseLlm that wraps Spring AI ChatModel and StreamingChatModel.
@@ -175,9 +177,11 @@ public class SpringAI extends BaseLlm {
   private Flowable<LlmResponse> generateContent(LlmRequest llmRequest) {
     SpringAIObservabilityHandler.RequestContext context =
         observabilityHandler.startRequest(model(), "chat");
+    ChatOptions defaultOptions = null;
 
     try {
-      Prompt prompt = messageConverter.toLlmPrompt(llmRequest, resolveDefaultOptions());
+      defaultOptions = resolveDefaultOptions();
+      Prompt prompt = messageConverter.toLlmPrompt(llmRequest, defaultOptions);
       observabilityHandler.logRequest(prompt.toString(), model());
 
       ChatResponse chatResponse = chatModel.call(prompt);
@@ -196,7 +200,10 @@ public class SpringAI extends BaseLlm {
       observabilityHandler.recordError(context, e);
       SpringAIErrorMapper.MappedError mappedError = SpringAIErrorMapper.mapError(e);
 
-      return Flowable.error(new RuntimeException(mappedError.getNormalizedMessage(), e));
+      return Flowable.error(
+          new RuntimeException(
+              withOptionsHint(mappedError.getNormalizedMessage(), e, llmRequest, defaultOptions),
+              e));
     }
   }
 
@@ -205,8 +212,14 @@ public class SpringAI extends BaseLlm {
         () -> {
           SpringAIObservabilityHandler.RequestContext context =
               observabilityHandler.startRequest(model(), "streaming");
-          // Deferred so a failure building the prompt also reaches onErrorResumeNext.
-          return Flowable.defer(() -> streamResponses(llmRequest))
+          AtomicReference<ChatOptions> defaultOptions = new AtomicReference<>();
+          // Deferred so a failure resolving the options or building the prompt also reaches
+          // onErrorResumeNext.
+          return Flowable.defer(
+                  () -> {
+                    defaultOptions.set(resolveDefaultOptions());
+                    return streamResponses(llmRequest, defaultOptions.get());
+                  })
               .doOnComplete(() -> observabilityHandler.recordSuccess(context, 0, 0, 0))
               .onErrorResumeNext(
                   error -> {
@@ -214,7 +227,13 @@ public class SpringAI extends BaseLlm {
                     SpringAIErrorMapper.MappedError mappedError =
                         SpringAIErrorMapper.mapError(error);
                     return Flowable.error(
-                        new RuntimeException(mappedError.getNormalizedMessage(), error));
+                        new RuntimeException(
+                            withOptionsHint(
+                                mappedError.getNormalizedMessage(),
+                                error,
+                                llmRequest,
+                                defaultOptions.get()),
+                            error));
                   });
         });
   }
@@ -224,8 +243,9 @@ public class SpringAI extends BaseLlm {
    * then one aggregated response, as {@code Gemini} does. ADK saves only the aggregated response to
    * the session and runs its function calls.
    */
-  private Flowable<LlmResponse> streamResponses(LlmRequest llmRequest) {
-    Prompt prompt = messageConverter.toLlmPrompt(llmRequest, resolveDefaultOptions());
+  private Flowable<LlmResponse> streamResponses(
+      LlmRequest llmRequest, @Nullable ChatOptions defaultOptions) {
+    Prompt prompt = messageConverter.toLlmPrompt(llmRequest, defaultOptions);
     observabilityHandler.logRequest(prompt.toString(), model());
     StreamAggregation aggregation = new StreamAggregation();
     return Flowable.fromPublisher(streamingChatModel.stream(prompt))
@@ -378,6 +398,43 @@ public class SpringAI extends BaseLlm {
       return ((ChatModel) streamingChatModel).getOptions();
     }
     return null;
+  }
+
+  /**
+   * Appends the likely cause to {@code message} when a request with tools failed with a {@link
+   * ClassCastException} while the model's default options are not {@link ToolCallingChatOptions}.
+   *
+   * <p>In that case the prompt carried provider-neutral tool options, which provider models that
+   * cast {@code Prompt.getOptions()} to their own options type reject. This usually means a
+   * delegating {@link ChatModel} does not override {@code getOptions()} and so returns the
+   * interface default instead of the underlying model's options.
+   */
+  private static String withOptionsHint(
+      String message,
+      Throwable error,
+      LlmRequest llmRequest,
+      @Nullable ChatOptions defaultOptions) {
+    if (defaultOptions == null
+        || defaultOptions instanceof ToolCallingChatOptions
+        || llmRequest.tools().isEmpty()
+        || !hasClassCastCause(error)) {
+      return message;
+    }
+    return message
+        + " (the ChatModel's getOptions() returned "
+        + defaultOptions.getClass().getName()
+        + ", which is not ToolCallingChatOptions, so the tools were sent in provider-neutral"
+        + " options; if the ChatModel wraps another model, override getOptions() to return the"
+        + " wrapped model's options)";
+  }
+
+  private static boolean hasClassCastCause(Throwable error) {
+    for (Throwable cause = error; cause != null; cause = cause.getCause()) {
+      if (cause instanceof ClassCastException) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private static String extractModelName(Object model) {
